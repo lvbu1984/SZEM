@@ -1,58 +1,48 @@
 package s3
 
 import (
-	"context"
+	"encoding/json"
+	"io"
 	"net/http"
-	"path"
+	"os"
 	"strings"
 
-	"github.com/weihaoli/szem/pkg/mk20"
+	"github.com/google/uuid"
+	"github.com/weihaoli/szem/pkg/core"
 	"github.com/weihaoli/szem/pkg/model"
+	"github.com/weihaoli/szem/pkg/repo"
+	"github.com/weihaoli/szem/pkg/storage"
 )
 
-func Handle(w http.ResponseWriter, r *http.Request) {
+func Handle(w http.ResponseWriter, r *http.Request, s storage.Storage, objects repo.ObjectRepo, jobs repo.JobRepo) {
 
-	// ===== GET =====
 	if r.Method == http.MethodGet {
-		handleGET(w, r)
+		handleGET(w, r, s, objects)
 		return
 	}
 
-	// ===== PUT only =====
 	if r.Method != http.MethodPut {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
+	// ===== Build RequestFacts (给 validatePUT 用) =====
 	facts := model.RequestFacts{
 		Method: r.Method,
-		Path:   r.URL.Path,
 	}
 
 	_, vErr := validatePUT(r, facts)
 	if vErr != nil {
-
 		msg := vErr.Error()
-
 		if msg == "missing Content-Length" {
 			writeError(w, http.StatusLengthRequired, msg)
 			return
 		}
-
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
 
-	cleanPath := strings.TrimPrefix(r.URL.Path, "/")
-	parts := strings.SplitN(cleanPath, "/", 2)
-	if len(parts) != 2 {
-		writeError(w, http.StatusBadRequest, "invalid path")
-		return
-	}
-
-	bucket := parts[0]
-	key := parts[1]
-
+	// ===== Body Limit =====
 	if r.ContentLength > MaxPutObjectSizeBytes {
 		writeError(w, http.StatusBadRequest, "EntityTooLarge")
 		return
@@ -61,37 +51,105 @@ func Handle(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, MaxPutObjectSizeBytes)
 	defer r.Body.Close()
 
-	var storage mk20.Storage = mk20.NewLocalClient("./data")
-
-	err := storage.Store(context.Background(), bucket, path.Clean(key), r.Body)
+	// ===== Parse path =====
+	bucket, key, err := parsePath(r.URL.Path)
 	if err != nil {
-
-		if strings.Contains(err.Error(), "http: request body too large") {
-			writeError(w, http.StatusBadRequest, "EntityTooLarge")
-			return
-		}
-
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-}
-
-func handleGET(w http.ResponseWriter, r *http.Request) {
-
-	cleanPath := strings.TrimPrefix(r.URL.Path, "/")
-	parts := strings.SplitN(cleanPath, "/", 2)
-	if len(parts) != 2 {
 		writeError(w, http.StatusBadRequest, "invalid path")
 		return
 	}
 
-	bucket := parts[0]
-	key := parts[1]
+	// ===== Stage to local (temporary only) =====
+	objectID := uuid.NewString()
+	stagingPath := "./data/staging/" + objectID
 
-	fullPath := path.Join("./data", bucket, key)
+	if err := core.WriteToFile(stagingPath, r.Body); err != nil {
+		writeError(w, http.StatusInternalServerError, "stage write failed: "+err.Error())
+		return
+	}
 
-	http.ServeFile(w, r, fullPath)
+	// ===== Metadata: committing =====
+	obj := repo.Object{
+		ObjectID:    objectID,
+		Bucket:      bucket,
+		Key:         key,
+		Size:        r.ContentLength,
+		Status:      repo.ObjectCommitting,
+		StagingPath: stagingPath,
+	}
+	if err := objects.CreateCommitting(r.Context(), obj); err != nil {
+		_ = os.Remove(stagingPath)
+		writeError(w, http.StatusInternalServerError, "db object create failed: "+err.Error())
+		return
+	}
+
+	// ===== Enqueue job =====
+	jobID, err := jobs.Enqueue(r.Context(), objectID)
+	if err != nil {
+		_ = objects.MarkFailed(r.Context(), objectID, "enqueue job failed: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "enqueue job failed: "+err.Error())
+		return
+	}
+
+	// ===== Return 202 Accepted (explicit async) =====
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusAccepted)
+
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"object_id": objectID,
+		"job_id":    jobID,
+		"status":    "committing",
+	})
+}
+
+func handleGET(w http.ResponseWriter, r *http.Request, s storage.Storage, objects repo.ObjectRepo) {
+
+	bucket, key, err := parsePath(r.URL.Path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid path")
+		return
+	}
+
+	// 查 metadata 状态
+	obj, err := objects.GetByPath(r.Context(), bucket, key)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+
+	switch obj.Status {
+	case repo.ObjectCommitting:
+		writeError(w, http.StatusConflict, "object is committing (async), try later")
+		return
+	case repo.ObjectFailed:
+		writeError(w, http.StatusInternalServerError, "object failed: "+obj.LastError)
+		return
+	case repo.ObjectAvailable:
+		// OK
+	default:
+		writeError(w, http.StatusInternalServerError, "unknown object status")
+		return
+	}
+
+	reader, err := s.Fetch(r.Context(), bucket, key)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	defer reader.Close()
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, reader)
+}
+
+func parsePath(path string) (string, string, error) {
+	if len(path) < 2 {
+		return "", "", http.ErrNotSupported
+	}
+	path = path[1:]
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", http.ErrNotSupported
+	}
+	return parts[0], parts[1], nil
 }
 

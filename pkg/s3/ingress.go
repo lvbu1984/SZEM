@@ -2,19 +2,26 @@ package s3
 
 import (
 	"net/http"
+
+	"github.com/weihaoli/szem/pkg/repo"
+	"github.com/weihaoli/szem/pkg/storage"
 )
 
-// ---- SZEM Ingress entrypoint ----
+type Ingress struct {
+	storage storage.Storage
+	objects repo.ObjectRepo
+	jobs    repo.JobRepo
+}
 
-type Ingress struct{}
-
-func NewIngress() http.Handler {
-	return &Ingress{}
+func NewIngress(s storage.Storage, objects repo.ObjectRepo, jobs repo.JobRepo) http.Handler {
+	return &Ingress{
+		storage: s,
+		objects: objects,
+		jobs:    jobs,
+	}
 }
 
 func (i *Ingress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
-	// 所有请求统一交给 Handle
-	Handle(w, r)
+	Handle(w, r, i.storage, i.objects, i.jobs)
 }
 

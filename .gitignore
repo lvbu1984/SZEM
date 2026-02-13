@@ -1,0 +1,7 @@
+# runtime data
+data/
+*.db
+
+# OS files
+.DS_Store
+
