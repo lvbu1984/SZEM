@@ -1,4 +1,4 @@
-package s3ingress
+package s3
 
 import (
 	"errors"
@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/your-org/szem/internal/model"
+	"github.com/weihaoli/szem/pkg/model"
 )
 
 // validate.go

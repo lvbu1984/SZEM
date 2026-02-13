@@ -1,3 +1,5 @@
-module github.com/your-org/szem
+module github.com/weihaoli/szem
 
 go 1.22.3
+
+require github.com/google/uuid v1.6.0

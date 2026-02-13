@@ -1,4 +1,4 @@
-package s3ingress
+package s3
 
 import "net/http"
 
